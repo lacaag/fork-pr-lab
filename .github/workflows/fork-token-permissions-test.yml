@@ -1,0 +1,183 @@
+# Fork PR Token Permissions Test
+# 
+# QUESTION: Does `permissions: contents: write` in the workflow YAML
+# actually grant a write-capable GITHUB_TOKEN to fork PRs?
+#
+# GitHub docs say fork PRs get read-only tokens BY DEFAULT.
+# But does an explicit `permissions:` block override that?
+#
+# TEST PLAN:
+# 1. Run on pull_request (from a fork) AND workflow_dispatch (for baseline)
+# 2. Check token permissions via the GitHub API
+# 3. Try an actual write operation (create a lightweight tag)
+# 4. Report results
+
+name: "Fork Token Permissions Test"
+
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      note:
+        description: 'Baseline test from main branch'
+        required: false
+        default: 'baseline'
+
+# THIS IS THE KEY: explicit write permissions
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  check-token-permissions:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: "Context Info"
+        run: |
+          echo "============================================"
+          echo "FORK TOKEN PERMISSIONS TEST"
+          echo "============================================"
+          echo "Event: ${{ github.event_name }}"
+          echo "Actor: ${{ github.actor }}"
+          echo "Repository: ${{ github.repository }}"
+          echo "Head Ref: ${{ github.head_ref }}"
+          echo "Base Ref: ${{ github.base_ref }}"
+          echo "Is Fork: ${{ github.event.pull_request.head.repo.fork || 'N/A' }}"
+          echo "PR Head Repo: ${{ github.event.pull_request.head.repo.full_name || 'N/A' }}"
+          echo "PR Base Repo: ${{ github.event.pull_request.base.repo.full_name || 'N/A' }}"
+          echo "Token first 10 chars: ${GITHUB_TOKEN:0:10}..."
+          echo "============================================"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: "API: Check Token Permissions"
+        run: |
+          echo "============================================"
+          echo "CHECKING TOKEN PERMISSIONS VIA API"
+          echo "============================================"
+          
+          # Check repo permissions the token has
+          echo "[1] Checking /repos endpoint for permissions..."
+          RESPONSE=$(curl -s -w "\n%{http_code}" \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}")
+          
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | head -n -1)
+          
+          echo "HTTP Status: $HTTP_CODE"
+          echo "Permissions field:"
+          echo "$BODY" | jq '.permissions' 2>/dev/null || echo "Could not parse permissions"
+          
+          # Check token scopes from response headers
+          echo ""
+          echo "[2] Checking X-OAuth-Scopes header..."
+          HEADERS=$(curl -sI \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}")
+          
+          echo "$HEADERS" | grep -i "x-oauth-scopes" || echo "No X-OAuth-Scopes header"
+          echo "$HEADERS" | grep -i "x-accepted-oauth-scopes" || echo "No X-Accepted-OAuth-Scopes header"
+          
+          echo ""
+          echo "[3] Checking rate limit endpoint for token identity..."
+          curl -s \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            "https://api.github.com/rate_limit" | jq '.rate' 2>/dev/null || echo "Rate limit check failed"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: "WRITE TEST: Try to create a git tag via API"
+        id: write_test
+        continue-on-error: true
+        run: |
+          echo "============================================"
+          echo "WRITE TEST: Creating tag via API"
+          echo "============================================"
+          
+          TAG_NAME="test-token-perms-$(date +%s)"
+          SHA=${{ github.sha }}
+          
+          echo "Attempting to create tag: $TAG_NAME at SHA: $SHA"
+          
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/git/refs" \
+            -d "{\"ref\":\"refs/tags/$TAG_NAME\",\"sha\":\"$SHA\"}")
+          
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | head -n -1)
+          
+          echo "HTTP Status: $HTTP_CODE"
+          echo "Response: $BODY"
+          
+          if [ "$HTTP_CODE" = "201" ]; then
+            echo "::error::WRITE SUCCEEDED! Token has write access on event=${{ github.event_name }}"
+            echo "write_result=SUCCESS" >> $GITHUB_OUTPUT
+            
+            # Clean up — delete the tag
+            echo "Cleaning up tag..."
+            curl -s -X DELETE \
+              -H "Authorization: Bearer $GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${{ github.repository }}/git/refs/tags/$TAG_NAME"
+          elif [ "$HTTP_CODE" = "403" ]; then
+            echo "::warning::WRITE BLOCKED (403). Token is read-only."
+            echo "write_result=BLOCKED_403" >> $GITHUB_OUTPUT
+          elif [ "$HTTP_CODE" = "422" ]; then
+            echo "::warning::WRITE REJECTED (422). Ref may already exist but auth was accepted."
+            echo "write_result=REJECTED_422" >> $GITHUB_OUTPUT
+          else
+            echo "::warning::UNEXPECTED STATUS: $HTTP_CODE"
+            echo "write_result=UNEXPECTED_$HTTP_CODE" >> $GITHUB_OUTPUT
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: "WRITE TEST 2: Try to create issue comment (if PR)"
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        run: |
+          echo "============================================"
+          echo "WRITE TEST 2: Create issue comment"
+          echo "============================================"
+          
+          PR_NUMBER=${{ github.event.pull_request.number }}
+          
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/issues/$PR_NUMBER/comments" \
+            -d '{"body":"[BOT] Token permissions test — this comment proves the token has issues:write scope on a PR event."}')
+          
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | head -n -1)
+          
+          echo "HTTP Status: $HTTP_CODE"
+          if [ "$HTTP_CODE" = "201" ]; then
+            echo "::error::ISSUE COMMENT WRITE SUCCEEDED! Token has issues:write on PR event."
+          else
+            echo "::warning::Issue comment write returned: $HTTP_CODE"
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: "SUMMARY"
+        run: |
+          echo "============================================"
+          echo "FINAL SUMMARY"
+          echo "============================================"
+          echo "Event type: ${{ github.event_name }}"
+          echo "Write test result: ${{ steps.write_test.outputs.write_result || 'N/A' }}"
+          echo "Write test outcome: ${{ steps.write_test.outcome }}"
+          echo ""
+          echo "If write_result=SUCCESS on pull_request from a fork:"
+          echo "  -> permissions: contents: write DOES elevate fork PR tokens"
+          echo "If write_result=BLOCKED_403 on pull_request from a fork:"
+          echo "  -> permissions: contents: write does NOT override fork read-only default"
+          echo "============================================"
