@@ -1,0 +1,1 @@
+fork PR attack test - checking GITHUB_TOKEN write capability on pull_request event
